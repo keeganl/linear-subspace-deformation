@@ -1,105 +1,78 @@
-//   igl::readOFF("../data/bunny.off", V, F);
-#include <igl/barycenter.h>
-#include <igl/cotmatrix.h>
-#include <igl/doublearea.h>
-#include <igl/grad.h>
-#include <igl/jet.h>
-#include <igl/massmatrix.h>
-#include <igl/per_vertex_normals.h>
-#include <igl/readDMAT.h>
-#include <igl/readOFF.h>
-#include <igl/repdiag.h>
 #include <igl/opengl/glfw/Viewer.h>
+#include <igl/copyleft/tetgen/tetrahedralize.h>
+#include <igl/readOFF.h>
+#include <igl/barycenter.h>
 
-#include <iostream>
-
-Eigen::MatrixXd V,U;
+// Input polygon
+Eigen::MatrixXd V;
 Eigen::MatrixXi F;
-Eigen::SparseMatrix<double> L;
-igl::opengl::glfw::Viewer viewer;
+Eigen::MatrixXd B;
+
+// Tetrahedralized interior
+Eigen::MatrixXd TV;
+Eigen::MatrixXi TT;
+Eigen::MatrixXi TF;
+
+// This function is called every time a keyboard button is pressed
+bool key_down(igl::opengl::glfw::Viewer& viewer, unsigned char key, int modifier)
+{
+  using namespace std;
+  using namespace Eigen;
+
+  if (key >= '1' && key <= '9')
+  {
+    double t = double((key - '1')+1) / 9.0;
+
+    VectorXd v = B.col(2).array() - B.col(2).minCoeff();
+    v /= v.col(0).maxCoeff();
+
+    vector<int> s;
+
+    for (unsigned i=0; i<v.size();++i)
+      if (v(i) < t)
+        s.push_back(i);
+
+    MatrixXd V_temp(s.size()*4,3);
+    MatrixXi F_temp(s.size()*4,3);
+
+    for (unsigned i=0; i<s.size();++i)
+    {
+      V_temp.row(i*4+0) = TV.row(TT(s[i],0));
+      V_temp.row(i*4+1) = TV.row(TT(s[i],1));
+      V_temp.row(i*4+2) = TV.row(TT(s[i],2));
+      V_temp.row(i*4+3) = TV.row(TT(s[i],3));
+      F_temp.row(i*4+0) << (i*4)+0, (i*4)+1, (i*4)+3;
+      F_temp.row(i*4+1) << (i*4)+0, (i*4)+2, (i*4)+1;
+      F_temp.row(i*4+2) << (i*4)+3, (i*4)+2, (i*4)+0;
+      F_temp.row(i*4+3) << (i*4)+1, (i*4)+2, (i*4)+3;
+    }
+
+    viewer.data().clear();
+    viewer.data().set_mesh(V_temp,F_temp);
+    viewer.data().set_face_based(true);
+  }
+
+
+  return false;
+}
 
 int main(int argc, char *argv[])
 {
   using namespace Eigen;
   using namespace std;
 
-  // Load a mesh in OFF format
-  igl::readOFF("../data/bunny.off", V, F);
+  // Load a surface mesh
+  igl::readOFF("../data/bunny.off",V,F);
 
-  // Compute Laplace-Beltrami operator: #V by #V
-  igl::cotmatrix(V,F,L);
+  // Tetrahedralize the interior
+  igl::copyleft::tetgen::tetrahedralize(V,F,"pq1.414Y", TV,TT,TF);
 
-  // Alternative construction of same Laplacian
-  SparseMatrix<double> G,K;
-  // Gradient/Divergence
-  igl::grad(V,F,G);
-  // Diagonal per-triangle "mass matrix"
-  VectorXd dblA;
-  igl::doublearea(V,F,dblA);
-  // Place areas along diagonal #dim times
-  const auto & T = 1.*(dblA.replicate(3,1)*0.5).asDiagonal();
-  // Laplacian K built as discrete divergence of gradient or equivalently
-  // discrete Dirichelet energy Hessian
-  K = -G.transpose() * T * G;
-  cout<<"|K-L|: "<<(K-L).norm()<<endl;
+  // Compute barycenters
+  igl::barycenter(TV,TT,B);
 
-  const auto &key_down = [](igl::opengl::glfw::Viewer &viewer,unsigned char key,int mod)->bool
-  {
-    switch(key)
-    {
-      case 'r':
-      case 'R':
-        U = V;
-        break;
-      case ' ':
-      {
-        // Recompute just mass matrix on each step
-        SparseMatrix<double> M;
-        igl::massmatrix(U,F,igl::MASSMATRIX_TYPE_BARYCENTRIC,M);
-        // Solve (M-delta*L) U = M*U
-        const auto & S = (M - 0.001*L);
-        Eigen::SimplicialLLT<Eigen::SparseMatrix<double > > solver(S);
-        assert(solver.info() == Eigen::Success);
-        U = solver.solve(M*U).eval();
-        // Compute centroid and subtract (also important for numerics)
-        VectorXd dblA;
-        igl::doublearea(U,F,dblA);
-        double area = 0.5*dblA.sum();
-        MatrixXd BC;
-        igl::barycenter(U,F,BC);
-        RowVector3d centroid(0,0,0);
-        for(int i = 0;i<BC.rows();i++)
-        {
-          centroid += 0.5*dblA(i)/area*BC.row(i);
-        }
-        U.rowwise() -= centroid;
-        // Normalize to unit surface area (important for numerics)
-        U.array() /= sqrt(area);
-        break;
-      }
-      default:
-        return false;
-    }
-    // Send new positions, update normals, recenter
-    viewer.data().set_vertices(U);
-    viewer.data().compute_normals();
-    viewer.core().align_camera_center(U,F);
-    return true;
-  };
-
-
-  // Use original normals as pseudo-colors
-  MatrixXd N;
-  igl::per_vertex_normals(V,F,N);
-  MatrixXd C = N.rowwise().normalized().array()*0.5+0.5;
-
-  // Initialize smoothing with base mesh
-  U = V;
-  viewer.data().set_mesh(U, F);
-  viewer.data().set_colors(C);
-  viewer.callback_key_down = key_down;
-
-  cout<<"Press [space] to smooth."<<endl;;
-  cout<<"Press [r] to reset."<<endl;;
-  return viewer.launch();
+  // Plot the generated mesh
+  igl::opengl::glfw::Viewer viewer;
+  viewer.callback_key_down = &key_down;
+  key_down(viewer,'5',0);
+  viewer.launch();
 }
